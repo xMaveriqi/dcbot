@@ -5,7 +5,8 @@ import discord
 from aiohttp import web
 from discord import app_commands
 
-from audacity_presets import chain_to_filter, describe_step, parse_audacity
+from audacity_presets import describe_step, parse_audacity
+from engine import apply_curves, ff_filter, plan
 
 BASE = Path(__file__).parent
 DEFAULT_PRESETS = BASE / "presets.default.json"
@@ -74,24 +75,36 @@ async def ffmpeg(etapa, *args):
         raise RuntimeError(f"[{etapa}] código {proc.returncode}\n{msg}")
 
 
-async def run_edit(inter, arquivo, filter_str, sufixo, titulo, detalhes, trim=(), preset_nome=None):
+RAW = ("-f", "f32le", "-ac", "2", "-ar", "44100")  # PCM float32 estéreo 44.1 kHz entre as etapas
+
+
+async def run_edit(inter, arquivo, chain, sufixo, titulo, detalhes, trim=(), extra_af=""):
     """A interação precisa já ter respondido (mensagem 'processando'); aqui só editamos ela."""
     limit = inter.guild.filesize_limit if inter.guild else DEFAULT_LIMIT
     try:
         with tempfile.TemporaryDirectory() as tmp:
-            src = Path(tmp) / "in"
+            tmp = Path(tmp)
+            src = tmp / "in"
             await arquivo.save(src)
-            fscript = Path(tmp) / "filter.txt"
-            fscript.write_text(filter_str, encoding="utf8")
-            # etapa 1: converte qualquer formato pra WAV 44.1 kHz estéreo (formato conhecido)
-            wav = Path(tmp) / "base.wav"
-            await ffmpeg("leitura", *trim, "-threads", "1", "-i", str(src), "-vn", "-ac", "2", "-ar", "44100",
-                         "-c:a", "pcm_s16le", str(wav))
+            # etapa 1: decodifica qualquer formato pra PCM float 44.1 kHz estéreo
+            cur = tmp / "s0.raw"
+            await ffmpeg("leitura", *trim, "-threads", "1", "-i", str(src), "-vn", *RAW, str(cur))
+            # etapa 2: passos do preset (graves/agudos no FFmpeg, curvas de EQ em Python)
+            for i, (kind, steps) in enumerate(plan(chain), 1):
+                nxt = tmp / f"s{i}.raw"
+                if kind == "ff":
+                    await ffmpeg("graves/agudos", "-threads", "1", *RAW, "-i", str(cur),
+                                 "-af", ff_filter(steps), *RAW, str(nxt))
+                else:
+                    await asyncio.to_thread(apply_curves, cur, nxt, steps)
+                cur.unlink(missing_ok=True)
+                cur = nxt
+            # etapa 3: limitador (evita estourar) + MP3
+            af = ",".join(f for f in (extra_af, "alimiter=limit=0.95" if chain else "") if f)
             nome = Path(arquivo.filename).stem + f"_{sufixo}.mp3"
-            out = Path(tmp) / nome
-            # etapa 2: aplica os filtros e gera o MP3
+            out = tmp / nome
             for bitrate in ("192k", "128k", "96k"):
-                await ffmpeg("filtros", "-threads", "1", "-i", str(wav), "-filter_script:a", str(fscript),
+                await ffmpeg("mp3", "-threads", "1", *RAW, "-i", str(cur), *(("-af", af) if af else ()),
                              "-threads", "1", "-b:a", bitrate, str(out))
                 if out.stat().st_size <= limit:
                     break
@@ -106,7 +119,7 @@ async def run_edit(inter, arquivo, filter_str, sufixo, titulo, detalhes, trim=()
             msg = await inter.edit_original_response(embed=e, attachments=[discord.File(out, nome)], view=None)
         url = msg.attachments[0].url
         e.add_field(name="🔗 Link pro servidor", value=f"```{url}```", inline=False)
-        await inter.edit_original_response(embed=e, view=ResultView(arquivo, inter.user.id, url, preset_nome))
+        await inter.edit_original_response(embed=e, view=ResultView(arquivo, inter.user.id, url))
     except Exception as ex:
         info = f"Arquivo: `{arquivo.filename}` ({arquivo.size / 1024 / 1024:.1f} MB)\n```{str(ex)[:900]}```"
         await inter.edit_original_response(embed=erro(info), view=None, attachments=[])
@@ -141,12 +154,11 @@ class PresetSelectView(discord.ui.View):
             return await inter.response.edit_message(embed=erro(f"Preset `{nome}` não existe mais."), view=None)
         await inter.response.edit_message(embed=processando(f"Aplicando **{nome}**..."), view=None)
         det = "\n".join(f"`{i}.` {describe_step(s)}" for i, s in enumerate(chain, 1))
-        await run_edit(inter, self.arquivo, chain_to_filter(chain), nome, "Música pronta", f"**Preset:** {nome}\n{det}",
-                       preset_nome=nome)
+        await run_edit(inter, self.arquivo, chain, nome, "Música pronta", f"**Preset:** {nome}\n{det}")
 
 
 class ResultView(discord.ui.View):
-    def __init__(self, arquivo, autor_id, url, preset_nome):
+    def __init__(self, arquivo, autor_id, url):
         super().__init__(timeout=300)
         self.arquivo, self.autor_id = arquivo, autor_id
         self.add_item(discord.ui.Button(style=discord.ButtonStyle.link, label="Abrir link", emoji="🔗", url=url))
@@ -216,8 +228,7 @@ async def editar(inter: discord.Interaction, arquivo: discord.Attachment, preset
         return await inter.response.send_message(embed=erro(f"Preset `{preset}` não existe. Use `/presets`."), ephemeral=True)
     await inter.response.send_message(embed=processando(f"Aplicando **{preset}**..."))
     det = "\n".join(f"`{i}.` {describe_step(s)}" for i, s in enumerate(chain, 1))
-    await run_edit(inter, arquivo, chain_to_filter(chain), preset, "Música pronta", f"**Preset:** {preset}\n{det}",
-                   preset_nome=preset)
+    await run_edit(inter, arquivo, chain, preset, "Música pronta", f"**Preset:** {preset}\n{det}")
 
 
 @tree.command(name="cortar", description="Corta um trecho da música (em segundos) com fade")
@@ -231,8 +242,9 @@ async def cortar(inter: discord.Interaction, arquivo: discord.Attachment, inicio
     fade = min(fade, dur / 2)
     f = f"afade=t=in:d={fade},afade=t=out:st={dur - fade}:d={fade}"
     await inter.response.send_message(embed=processando("Cortando..."))
-    await run_edit(inter, arquivo, f, "corte", "Corte pronto",
-                   f"✂️ {inicio:g}s → {fim:g}s ({dur:g}s)\n🌅 Fade de {fade:g}s", trim=("-ss", str(inicio), "-t", str(dur)))
+    await run_edit(inter, arquivo, [], "corte", "Corte pronto",
+                   f"✂️ {inicio:g}s → {fim:g}s ({dur:g}s)\n🌅 Fade de {fade:g}s",
+                   trim=("-ss", str(inicio), "-t", str(dur)), extra_af=f)
 
 
 @tree.command(name="preset_importar", description="Cria um preset a partir de presets do Audacity (.txt ou .zip)")
