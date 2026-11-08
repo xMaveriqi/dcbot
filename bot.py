@@ -64,7 +64,7 @@ def eh_audio(a: discord.Attachment):
 # ---------- ffmpeg ----------
 async def ffmpeg(*args):
     proc = await asyncio.create_subprocess_exec(
-        "ffmpeg", "-v", "error", "-y", *args,
+        "ffmpeg", "-nostdin", "-v", "error", "-y", "-filter_threads", "1", *args,
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
     _, err = await proc.communicate()
     if proc.returncode != 0:
@@ -83,8 +83,8 @@ async def run_edit(inter, arquivo, filter_str, sufixo, titulo, detalhes, trim=()
             nome = Path(arquivo.filename).stem + f"_{sufixo}.mp3"
             out = Path(tmp) / nome
             for bitrate in ("192k", "128k", "96k"):
-                await ffmpeg(*trim, "-i", str(src), "-vn", "-filter_script:a", str(fscript),
-                             "-ar", "44100", "-b:a", bitrate, str(out))
+                await ffmpeg(*trim, "-threads", "1", "-i", str(src), "-vn", "-filter_script:a", str(fscript),
+                             "-ar", "44100", "-threads", "1", "-b:a", bitrate, str(out))
                 if out.stat().st_size <= limit:
                     break
             else:
