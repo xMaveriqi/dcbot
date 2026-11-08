@@ -62,13 +62,16 @@ def eh_audio(a: discord.Attachment):
 
 
 # ---------- ffmpeg ----------
-async def ffmpeg(*args):
+async def ffmpeg(etapa, *args):
     proc = await asyncio.create_subprocess_exec(
         "ffmpeg", "-nostdin", "-v", "error", "-y", "-filter_threads", "1", *args,
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
     _, err = await proc.communicate()
     if proc.returncode != 0:
-        raise RuntimeError(err.decode(errors="replace")[-400:])
+        msg = err.decode(errors="replace").strip()
+        if len(msg) > 900:
+            msg = msg[:450] + "\n...\n" + msg[-450:]
+        raise RuntimeError(f"[{etapa}] código {proc.returncode}\n{msg}")
 
 
 async def run_edit(inter, arquivo, filter_str, sufixo, titulo, detalhes, trim=(), preset_nome=None):
@@ -80,11 +83,16 @@ async def run_edit(inter, arquivo, filter_str, sufixo, titulo, detalhes, trim=()
             await arquivo.save(src)
             fscript = Path(tmp) / "filter.txt"
             fscript.write_text(filter_str, encoding="utf8")
+            # etapa 1: converte qualquer formato pra WAV 44.1 kHz estéreo (formato conhecido)
+            wav = Path(tmp) / "base.wav"
+            await ffmpeg("leitura", *trim, "-threads", "1", "-i", str(src), "-vn", "-ac", "2", "-ar", "44100",
+                         "-c:a", "pcm_s16le", str(wav))
             nome = Path(arquivo.filename).stem + f"_{sufixo}.mp3"
             out = Path(tmp) / nome
+            # etapa 2: aplica os filtros e gera o MP3
             for bitrate in ("192k", "128k", "96k"):
-                await ffmpeg(*trim, "-threads", "1", "-i", str(src), "-vn", "-filter_script:a", str(fscript),
-                             "-ar", "44100", "-threads", "1", "-b:a", bitrate, str(out))
+                await ffmpeg("filtros", "-threads", "1", "-i", str(wav), "-filter_script:a", str(fscript),
+                             "-threads", "1", "-b:a", bitrate, str(out))
                 if out.stat().st_size <= limit:
                     break
             else:
@@ -100,7 +108,8 @@ async def run_edit(inter, arquivo, filter_str, sufixo, titulo, detalhes, trim=()
         e.add_field(name="🔗 Link pro servidor", value=f"```{url}```", inline=False)
         await inter.edit_original_response(embed=e, view=ResultView(arquivo, inter.user.id, url, preset_nome))
     except Exception as ex:
-        await inter.edit_original_response(embed=erro(f"```{ex}```"), view=None, attachments=[])
+        info = f"Arquivo: `{arquivo.filename}` ({arquivo.size / 1024 / 1024:.1f} MB)\n```{str(ex)[:900]}```"
+        await inter.edit_original_response(embed=erro(info), view=None, attachments=[])
 
 
 def processando(txt="Processando seu áudio..."):
