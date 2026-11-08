@@ -1,0 +1,14 @@
+services:
+  - type: worker          # worker exige plano pago no Render
+    name: audio-bot
+    runtime: docker
+    plan: starter
+    disk:                 # disco persistente pros presets
+      name: data
+      mountPath: /data
+      sizeGB: 1
+    envVars:
+      - key: DISCORD_TOKEN
+        sync: false
+      - key: PRESETS_PATH
+        value: /data/presets.json
